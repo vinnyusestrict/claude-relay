@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""
+Claude Relay — Inter-agent messaging for Claude Code sessions.
+
+Usage:
+  relay-msg send <target> <message>    Send a message to an agent or group
+  relay-msg check                      Check for unread messages (marks as read)
+  relay-msg check --peek               Check unread without marking as read
+  relay-msg check --history            Show all messages including already-read
+  relay-msg register <name> [options]  Register this agent
+  relay-msg unregister <name>          Remove an agent
+  relay-msg list                       List registered agents and groups
+
+Options for register:
+  --group <name>     Add agent to a group (repeatable)
+  --cwd <pattern>    CWD pattern for auto-detection (e.g. "strictwp-cody")
+  --transport local  How this agent connects to MySQL: "local" (direct) or "remote" (via run-cmd)
+
+Agents self-register into a relay_agents table. No hardcoded peers.
+Groups are derived from agent registrations — no hardcoded broadcast lists.
+
+Messages are stored in local MySQL. Read messages are marked with read_at
+(not deleted) to preserve conversation history.
+"""
+import sys
+import os
+import subprocess
+import argparse
+
+DB_USER = os.environ.get("RELAY_DB_USER", "root")
+DB_PASS = os.environ.get("RELAY_DB_PASS", "root")
+DB_NAME = os.environ.get("RELAY_DB_NAME", "strictwp_local")
+
+_schema_checked = False
+
+
+def detect_self():
+    """Detect which agent is running this script.
+
+    Priority:
+      1. RELAY_IDENTITY env var — always wins
+      2. CWD patterns from relay_agents table
+      3. gh-availability fallback (cody vs cowork)
+    """
+    identity = os.environ.get("RELAY_IDENTITY")
+    if identity:
+        return identity
+
+    # Try CWD-based detection from registered agents.
+    cwd = os.getcwd()
+    try:
+        rows = run_sql(
+            "SELECT name, cwd_pattern FROM relay_agents WHERE cwd_pattern IS NOT NULL AND cwd_pattern != ''",
+            fetch=True,
+        )
+        for row in rows:
+            parts = row.split("\t", 1)
+            if len(parts) == 2 and parts[1] in cwd:
+                return parts[0]
+    except SystemExit:
+        pass
+
+    # Fallback: gh available = Mac (cody), otherwise VM (cowork).
+    if os.system("command -v gh >/dev/null 2>&1") == 0:
+        return "cody"
+    return "cowork"
+
+
+def run_sql(sql, fetch=False):
+    """Run SQL against local MySQL. Returns output lines if fetch=True."""
+    me_transport = _get_transport()
+
+    if me_transport == "local":
+        cmd = ["mysql", "-u", DB_USER, f"-p{DB_PASS}", "-N", "-B", DB_NAME, "-e", sql]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            print(f"MySQL error: {result.stderr.strip()}", file=sys.stderr)
+            sys.exit(2)
+        return result.stdout.strip().splitlines() if fetch else []
+    else:
+        # Remote: route through run-cmd local channel.
+        run_cmd = _find_run_cmd()
+        safe_sql = sql.replace("'", "'\\''")
+        mysql_cmd = f"mysql -u {DB_USER} -p{DB_PASS} -N -B {DB_NAME} -e '{safe_sql}'"
+        result = subprocess.run(
+            ["python3", run_cmd, "local", mysql_cmd, "--timeout=15"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if result.returncode != 0:
+            err = result.stderr.strip() or "timed out waiting for MySQL result"
+            print(f"Relay error: {err}", file=sys.stderr)
+            sys.exit(2)
+        return result.stdout.strip().splitlines() if fetch else []
+
+
+def _get_transport():
+    """Determine transport for current agent: 'local' or 'remote'."""
+    me = detect_self()
+    try:
+        rows = run_sql_raw(
+            f"SELECT transport FROM relay_agents WHERE name = '{_esc(me)}' LIMIT 1",
+            fetch=True,
+        )
+        if rows and rows[0].strip():
+            return rows[0].strip()
+    except Exception:
+        pass
+    # Default: local if gh is available (Mac), remote otherwise.
+    if os.system("command -v gh >/dev/null 2>&1") == 0:
+        return "local"
+    return "remote"
+
+
+def run_sql_raw(sql, fetch=False):
+    """Direct local MySQL — used for bootstrap before transport is known."""
+    cmd = ["mysql", "-u", DB_USER, f"-p{DB_PASS}", "-N", "-B", DB_NAME, "-e", sql]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        return [] if fetch else None
+    return result.stdout.strip().splitlines() if fetch else []
+
+
+def _find_run_cmd():
+    """Find the run-cmd script relative to this script or the repo root."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # If installed as submodule at lib/relay/, run-cmd is at ../../bin/run-cmd
+    candidate = os.path.join(script_dir, "..", "..", "bin", "run-cmd")
+    if os.path.exists(candidate):
+        return os.path.abspath(candidate)
+    # Fallback: look in the repo root detected from CWD
+    repo_root = os.environ.get("RELAY_REPO_ROOT", os.getcwd())
+    return os.path.join(repo_root, "bin", "run-cmd")
+
+
+def _esc(s):
+    """Escape a string for SQL single-quote contexts."""
+    return s.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def ensure_schema():
+    """Idempotent: create tables if they don't exist."""
+    global _schema_checked
+    if _schema_checked:
+        return
+    _schema_checked = True
+    try:
+        run_sql_raw("""
+            CREATE TABLE IF NOT EXISTS relay_agents (
+                name VARCHAR(40) PRIMARY KEY,
+                transport ENUM('local','remote') NOT NULL DEFAULT 'local',
+                cwd_pattern VARCHAR(255) DEFAULT NULL,
+                registered_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        run_sql_raw("""
+            CREATE TABLE IF NOT EXISTS relay_agent_groups (
+                agent_name VARCHAR(40) NOT NULL,
+                group_name VARCHAR(40) NOT NULL,
+                PRIMARY KEY (agent_name, group_name),
+                FOREIGN KEY (agent_name) REFERENCES relay_agents(name) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        run_sql_raw("""
+            CREATE TABLE IF NOT EXISTS relay_messages (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                target VARCHAR(40) NOT NULL,
+                sender VARCHAR(40) NOT NULL,
+                message TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                read_at TIMESTAMP NULL DEFAULT NULL,
+                KEY idx_target (target),
+                KEY idx_read_at (read_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+    except SystemExit:
+        pass
+
+
+# ── Commands ────────────────────────────────────────────────────────────
+
+
+def cmd_register(name, groups=None, cwd_pattern=None, transport="local"):
+    """Register an agent."""
+    ensure_schema()
+    safe_name = _esc(name)
+    safe_cwd = f"'{_esc(cwd_pattern)}'" if cwd_pattern else "NULL"
+    run_sql(
+        f"INSERT INTO relay_agents (name, transport, cwd_pattern) "
+        f"VALUES ('{safe_name}', '{_esc(transport)}', {safe_cwd}) "
+        f"ON DUPLICATE KEY UPDATE transport='{_esc(transport)}', cwd_pattern={safe_cwd}"
+    )
+    # Clear old groups and set new ones.
+    run_sql(f"DELETE FROM relay_agent_groups WHERE agent_name = '{safe_name}'")
+    for g in (groups or []):
+        run_sql(
+            f"INSERT INTO relay_agent_groups (agent_name, group_name) "
+            f"VALUES ('{safe_name}', '{_esc(g)}')"
+        )
+    group_str = f" (groups: {', '.join(groups)})" if groups else ""
+    print(f"Registered: {name}{group_str}")
+
+
+def cmd_unregister(name):
+    """Remove an agent."""
+    ensure_schema()
+    run_sql(f"DELETE FROM relay_agents WHERE name = '{_esc(name)}'")
+    print(f"Unregistered: {name}")
+
+
+def cmd_list():
+    """List all registered agents and groups."""
+    ensure_schema()
+    rows = run_sql(
+        "SELECT a.name, a.transport, a.cwd_pattern, "
+        "GROUP_CONCAT(g.group_name ORDER BY g.group_name SEPARATOR ', ') AS groups "
+        "FROM relay_agents a "
+        "LEFT JOIN relay_agent_groups g ON a.name = g.agent_name "
+        "GROUP BY a.name ORDER BY a.name",
+        fetch=True,
+    )
+    if not rows:
+        print("No agents registered.")
+        return
+    print(f"{'Agent':<15} {'Transport':<10} {'Groups':<25} {'CWD Pattern'}")
+    print("-" * 70)
+    for row in rows:
+        parts = row.split("\t", 3)
+        name = parts[0] if len(parts) > 0 else ""
+        transport = parts[1] if len(parts) > 1 else ""
+        cwd = parts[2] if len(parts) > 2 and parts[2] != "NULL" else ""
+        groups = parts[3] if len(parts) > 3 and parts[3] != "NULL" else ""
+        print(f"{name:<15} {transport:<10} {groups:<25} {cwd}")
+
+
+def _get_group_members(group_name):
+    """Get all agent names in a group."""
+    rows = run_sql(
+        f"SELECT agent_name FROM relay_agent_groups WHERE group_name = '{_esc(group_name)}'",
+        fetch=True,
+    )
+    return [r.strip() for r in rows if r.strip()]
+
+
+def _get_all_agents():
+    """Get all registered agent names."""
+    rows = run_sql("SELECT name FROM relay_agents", fetch=True)
+    return [r.strip() for r in rows if r.strip()]
+
+
+def _get_all_groups():
+    """Get all distinct group names."""
+    rows = run_sql("SELECT DISTINCT group_name FROM relay_agent_groups", fetch=True)
+    return [r.strip() for r in rows if r.strip()]
+
+
+def cmd_send(target, message):
+    """Send a message to an agent or group."""
+    ensure_schema()
+    me = detect_self()
+
+    # Check if target is a registered agent.
+    all_agents = _get_all_agents()
+    all_groups = _get_all_groups()
+
+    # Special target: "all" broadcasts to every agent except sender.
+    if target == "all":
+        recipients = [a for a in all_agents if a != me]
+        if not recipients:
+            print("No other agents registered.", file=sys.stderr)
+            sys.exit(1)
+        message = f"[broadcast] {message}"
+    elif target in all_groups:
+        recipients = [a for a in _get_group_members(target) if a != me]
+        if not recipients:
+            print(f"No peers in '{target}' group besides yourself.", file=sys.stderr)
+            sys.exit(1)
+        message = f"[broadcast:{target}] {message}"
+    elif target in all_agents:
+        recipients = [target]
+    else:
+        # Unknown target — still allow sending (agent may register later).
+        print(f"Warning: '{target}' is not a registered agent or group. Sending anyway.", file=sys.stderr)
+        recipients = [target]
+
+    safe_msg = _esc(message)
+    values = ", ".join(f"('{_esc(r)}', '{_esc(me)}', '{safe_msg}')" for r in recipients)
+    run_sql(f"INSERT INTO relay_messages (target, sender, message) VALUES {values}")
+
+    if len(recipients) > 1:
+        print(f"Broadcast ({target}) sent to: {', '.join(recipients)}")
+    else:
+        print(f"Message sent to {recipients[0]}")
+
+
+def cmd_check(peek=False, history=False):
+    """Check for messages."""
+    ensure_schema()
+    me = detect_self()
+
+    # Build target clause — include any legacy aliases.
+    targets = [f"'{_esc(me)}'"]
+    # Legacy: cody also picks up claude-code messages.
+    if me == "cody":
+        targets.append("'claude-code'")
+    targets_clause = f"target IN ({', '.join(targets)})"
+
+    if history:
+        where = targets_clause
+    else:
+        where = f"{targets_clause} AND read_at IS NULL"
+
+    lines = run_sql(
+        f"SELECT id, sender, created_at, message, read_at "
+        f"FROM relay_messages WHERE {where} ORDER BY created_at",
+        fetch=True,
+    )
+
+    if not lines:
+        if history:
+            print("No message history.")
+        return
+
+    ids = []
+    for line in lines:
+        parts = line.split("\t", 4)
+        if len(parts) >= 4:
+            ids.append(parts[0])
+            ts = parts[2][:19].replace("T", " ")
+            read_marker = " [read]" if len(parts) > 4 and parts[4] != "NULL" else ""
+            print(f"[{parts[1]}] ({ts}){read_marker} {parts[3]}")
+
+    # Mark unread as read (unless peeking or viewing history).
+    if not peek and not history and ids:
+        id_list = ",".join(ids)
+        run_sql(f"UPDATE relay_messages SET read_at = NOW() WHERE id IN ({id_list}) AND read_at IS NULL")
+
+
+# ── CLI ─────────────────────────────────────────────────────────────────
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+
+    if cmd == "send":
+        if len(sys.argv) < 4:
+            print("Usage: relay-msg send <target> <message>", file=sys.stderr)
+            sys.exit(1)
+        cmd_send(sys.argv[2], " ".join(sys.argv[3:]))
+
+    elif cmd == "check":
+        peek = "--peek" in sys.argv
+        history = "--history" in sys.argv
+        cmd_check(peek=peek, history=history)
+
+    elif cmd == "register":
+        if len(sys.argv) < 3:
+            print("Usage: relay-msg register <name> [--group <g>] [--cwd <pattern>] [--transport local|remote]", file=sys.stderr)
+            sys.exit(1)
+        name = sys.argv[2]
+        groups = []
+        cwd_pattern = None
+        transport = "local"
+        i = 3
+        while i < len(sys.argv):
+            if sys.argv[i] == "--group" and i + 1 < len(sys.argv):
+                groups.append(sys.argv[i + 1])
+                i += 2
+            elif sys.argv[i] == "--cwd" and i + 1 < len(sys.argv):
+                cwd_pattern = sys.argv[i + 1]
+                i += 2
+            elif sys.argv[i] == "--transport" and i + 1 < len(sys.argv):
+                transport = sys.argv[i + 1]
+                i += 2
+            else:
+                i += 1
+        cmd_register(name, groups=groups, cwd_pattern=cwd_pattern, transport=transport)
+
+    elif cmd == "unregister":
+        if len(sys.argv) < 3:
+            print("Usage: relay-msg unregister <name>", file=sys.stderr)
+            sys.exit(1)
+        cmd_unregister(sys.argv[2])
+
+    elif cmd == "list":
+        cmd_list()
+
+    else:
+        print(f"Unknown command: {cmd}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
