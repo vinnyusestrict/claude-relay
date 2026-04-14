@@ -49,7 +49,7 @@ def detect_self():
     # Try CWD-based detection from registered agents.
     cwd = os.getcwd()
     try:
-        rows = run_sql(
+        rows = run_sql_raw(
             "SELECT name, cwd_pattern FROM relay_agents WHERE cwd_pattern IS NOT NULL AND cwd_pattern != ''",
             fetch=True,
         )
