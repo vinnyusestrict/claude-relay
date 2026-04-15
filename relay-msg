@@ -34,6 +34,37 @@ import sys
 import os
 import subprocess
 
+
+def _load_env_file():
+    """Load .relay-env from the script's directory or the repo root (two levels up).
+
+    File format: KEY=VALUE (one per line, no export, no quotes required).
+    Skips blank lines and comments (#).
+    Does NOT override values already set in the environment.
+    """
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".relay-env"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".relay-env"),
+    ]
+    for path in candidates:
+        path = os.path.abspath(path)
+        if os.path.isfile(path):
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        key, _, value = line.partition("=")
+                        key = key.strip()
+                        value = value.strip().strip("'\"")
+                        if key and key not in os.environ:
+                            os.environ[key] = value
+            break
+
+
+_load_env_file()
+
 DB_USER = os.environ.get("RELAY_DB_USER", "root")
 DB_PASS = os.environ.get("RELAY_DB_PASS", "root")
 DB_NAME = os.environ.get("RELAY_DB_NAME", "claude_relay")

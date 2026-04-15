@@ -1,0 +1,7 @@
+# Claude Relay configuration
+# Copy to .relay-env and edit. This file is gitignored.
+RELAY_DB_USER=root
+RELAY_DB_PASS=root
+RELAY_DB_NAME=claude_relay
+# RELAY_IDENTITY=my-agent
+# RELAY_PROXY_CMD=python3 /path/to/proxy local

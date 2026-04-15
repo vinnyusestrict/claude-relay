@@ -14,7 +14,7 @@ From your project root:
 git submodule add https://github.com/vinnyusestrict/claude-relay.git lib/relay
 ```
 
-### 2. Create the database
+### 2. Configure the database
 
 Claude Relay uses local MySQL/MariaDB. Create the database — tables are auto-created on first use:
 
@@ -22,12 +22,23 @@ Claude Relay uses local MySQL/MariaDB. Create the database — tables are auto-c
 mysql -u root -proot -e "CREATE DATABASE IF NOT EXISTS claude_relay"
 ```
 
-Override credentials with env vars if needed:
+Copy the example env file and edit it with your credentials:
+
 ```bash
-export RELAY_DB_USER=root
-export RELAY_DB_PASS=root
-export RELAY_DB_NAME=claude_relay
+cp lib/relay/.relay-env.example lib/relay/.relay-env
+# Edit lib/relay/.relay-env with your DB credentials
 ```
+
+Or place `.relay-env` in your project root (the relay checks both locations). The file is gitignored — credentials never get committed.
+
+```
+# .relay-env
+RELAY_DB_USER=root
+RELAY_DB_PASS=root
+RELAY_DB_NAME=claude_relay
+```
+
+Environment variables still work and take precedence over the file.
 
 ### 3. Register this agent
 
