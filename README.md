@@ -78,10 +78,7 @@ Add to `.claude/settings.json` in your project so incoming messages appear on ev
 }
 ```
 
-If your database name differs from the default (`claude_relay`), prefix the command:
-```
-RELAY_DB_NAME=my_db python3 lib/relay/relay-msg check 2>/dev/null || true
-```
+If your database name differs from the default (`claude_relay`), set it in `.relay-env` (step 2) — no need to change the hook command.
 
 ### 5. Verify
 
