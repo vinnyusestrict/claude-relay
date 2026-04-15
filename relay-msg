@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Claude Relay — Inter-agent messaging for Claude Code sessions.
+Agent Relay — Inter-agent messaging for AI coding agents.
 
 Usage:
   relay-msg send <target> <message>    Send a message to an agent or group
@@ -15,7 +15,7 @@ Options for register:
   --group <name>       Add agent to a group (repeatable)
   --cwd <pattern>      CWD pattern for auto-detection
   --transport local    How this agent connects to MySQL: "local" (direct) or "remote" (via proxy)
-  --alias <name>       Legacy name this agent also receives messages for (repeatable)
+  --alias <name>       Alternate name this agent also receives messages for (repeatable)
 
 Agents self-register into a relay_agents table. No hardcoded peers.
 Groups are derived from agent registrations — no hardcoded broadcast lists.
@@ -23,11 +23,12 @@ Groups are derived from agent registrations — no hardcoded broadcast lists.
 Messages are stored in local MySQL/MariaDB. Read messages are marked with
 read_at (not deleted) to preserve conversation history.
 
-Environment variables:
+Configuration via .relay-env file (gitignored) or environment variables:
   RELAY_DB_USER      MySQL user (default: root)
   RELAY_DB_PASS      MySQL password (default: root)
-  RELAY_DB_NAME      Database name (default: claude_relay)
+  RELAY_DB_NAME      Database name (default: agent_relay)
   RELAY_IDENTITY     Force agent identity (skips auto-detection)
+  RELAY_TRANSPORT    "local" or "remote" (default: local)
   RELAY_PROXY_CMD    Command to proxy MySQL for remote agents (optional)
 """
 import sys
@@ -67,7 +68,7 @@ _load_env_file()
 
 DB_USER = os.environ.get("RELAY_DB_USER", "root")
 DB_PASS = os.environ.get("RELAY_DB_PASS", "root")
-DB_NAME = os.environ.get("RELAY_DB_NAME", "claude_relay")
+DB_NAME = os.environ.get("RELAY_DB_NAME", "agent_relay")
 
 _schema_checked = False
 
