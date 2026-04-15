@@ -409,43 +409,43 @@ class TestCmdList(unittest.TestCase):
 class TestLoadEnvFile(unittest.TestCase):
     """Test .relay-env file loading."""
 
+    def _parse_env_line(self, value_str):
+        """Apply the same parsing logic as _load_env_file to a value."""
+        value = value_str.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        return value
+
     def test_loads_key_value_pairs(self):
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
-            f.write("MY_TEST_KEY=my_test_value\n")
-            f.write("# comment line\n")
-            f.write("\n")
-            f.write("ANOTHER_KEY='quoted_value'\n")
-            path = f.name
-        try:
-            env = os.environ.copy()
-            env.pop("MY_TEST_KEY", None)
-            env.pop("ANOTHER_KEY", None)
-            with patch.dict(os.environ, env, clear=True):
-                # Manually simulate _load_env_file with our test file.
-                with open(path) as fh:
-                    for line in fh:
-                        line = line.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                        if "=" in line:
-                            key, _, value = line.partition("=")
-                            key = key.strip()
-                            value = value.strip().strip("'\"")
-                            if key and key not in os.environ:
-                                os.environ[key] = value
-                self.assertEqual(os.environ.get("MY_TEST_KEY"), "my_test_value")
-                self.assertEqual(os.environ.get("ANOTHER_KEY"), "quoted_value")
-        finally:
-            os.unlink(path)
+        self.assertEqual(self._parse_env_line("my_test_value"), "my_test_value")
+        self.assertEqual(self._parse_env_line("'quoted_value'"), "quoted_value")
+        self.assertEqual(self._parse_env_line('"double_quoted"'), "double_quoted")
+
+    def test_symmetric_quotes_stripped(self):
+        self.assertEqual(self._parse_env_line("'hello world'"), "hello world")
+        self.assertEqual(self._parse_env_line('"hello world"'), "hello world")
+
+    def test_asymmetric_quotes_preserved(self):
+        """Trailing quote without matching opening quote is kept (Cowork bug fix)."""
+        self.assertEqual(self._parse_env_line('bar"'), 'bar"')
+        self.assertEqual(self._parse_env_line("bar'"), "bar'")
+        self.assertEqual(self._parse_env_line('"bar'), '"bar')
+
+    def test_value_with_inner_quotes_preserved(self):
+        """Values like python3 cmd local "{}" keep internal quotes."""
+        self.assertEqual(
+            self._parse_env_line('python3 /path/to/cmd local "{}"'),
+            'python3 /path/to/cmd local "{}"',
+        )
 
     def test_env_vars_take_precedence(self):
         import tempfile
         with tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
-            f.write("MY_EXISTING_KEY=from_file\n")
+            f.write("_TEST_EXISTING_KEY=from_file\n")
             path = f.name
         try:
-            with patch.dict(os.environ, {"MY_EXISTING_KEY": "from_env"}):
+            with patch.dict(os.environ, {"_TEST_EXISTING_KEY": "from_env"}):
+                # Simulate: file says from_file but env already has from_env.
                 with open(path) as fh:
                     for line in fh:
                         line = line.strip()
@@ -454,11 +454,10 @@ class TestLoadEnvFile(unittest.TestCase):
                         if "=" in line:
                             key, _, value = line.partition("=")
                             key = key.strip()
-                            value = value.strip().strip("'\"")
+                            value = self._parse_env_line(value)
                             if key and key not in os.environ:
                                 os.environ[key] = value
-                # Env var should win.
-                self.assertEqual(os.environ["MY_EXISTING_KEY"], "from_env")
+                self.assertEqual(os.environ["_TEST_EXISTING_KEY"], "from_env")
         finally:
             os.unlink(path)
 

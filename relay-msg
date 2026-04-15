@@ -58,7 +58,10 @@ def _load_env_file():
                     if "=" in line:
                         key, _, value = line.partition("=")
                         key = key.strip()
-                        value = value.strip().strip("'\"")
+                        value = value.strip()
+                        # Only strip outer quotes if they form a symmetric pair.
+                        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                            value = value[1:-1]
                         if key and key not in os.environ:
                             os.environ[key] = value
             break
