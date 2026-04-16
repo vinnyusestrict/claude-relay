@@ -97,9 +97,23 @@ def _mysql_local_cmd(sql):
 
 
 def _mysql_remote_shellcmd(sql):
+    """Single-quote-escaped mysql command for the shell=True proxy path."""
     safe_sql = sql.replace("'", "'\\''")
     return (f"mysql -u {DB_USER} -p{DB_PASS} --default-character-set=utf8mb4 "
             f"-N -B {DB_NAME} -e '{safe_sql}'")
+
+
+def _mysql_remote_quoted_cmdstr(sql):
+    """Double-quote-escaped mysql command string for the direct-invocation path.
+    Inner single quotes (SQL string literals) survive the intermediate
+    run-cmd → sh layer because we double-quote -e and escape shell-meaningful
+    characters inside the double-quoted string."""
+    escaped = (sql.replace("\\", "\\\\")
+                  .replace('"', '\\"')
+                  .replace('$', '\\$')
+                  .replace('`', '\\`'))
+    return (f'mysql -u {DB_USER} -p{DB_PASS} --default-character-set=utf8mb4 '
+            f'-N -B {DB_NAME} -e "{escaped}"')
 
 
 def detect_self():
@@ -149,17 +163,28 @@ def run_sql(sql, fetch=False):
             sys.exit(2)
         return result.stdout.strip().splitlines() if fetch else []
     else:
-        # Remote: route through proxy command.
-        proxy_cmd = _get_proxy_cmd()
-        if not proxy_cmd:
-            print("Remote transport requires RELAY_PROXY_CMD env var or a proxy command.", file=sys.stderr)
-            sys.exit(2)
-        mysql_cmd = _mysql_remote_shellcmd(sql)
-        full_cmd = proxy_cmd.replace("{}", mysql_cmd) if "{}" in proxy_cmd else f"{proxy_cmd} {mysql_cmd}"
-        result = subprocess.run(
-            full_cmd, shell=True,
-            capture_output=True, text=True, timeout=20,
-        )
+        # Remote: two invocation styles.
+        # - User-supplied RELAY_PROXY_CMD → legacy shell=True pipeline so
+        #   custom proxies (ssh, docker exec, etc.) keep working.
+        # - Auto-detected bin/run-cmd → direct Python argv invocation with
+        #   double-quoted -e (cowork-style). Bypasses multi-layer shell
+        #   quoting that previously corrupted SQL single quotes in
+        #   Python → sh → run-cmd → watcher → sh pipelines.
+        user_proxy = os.environ.get("RELAY_PROXY_CMD")
+        if user_proxy:
+            mysql_cmd = _mysql_remote_shellcmd(sql)
+            full_cmd = user_proxy.replace("{}", mysql_cmd) if "{}" in user_proxy else f"{user_proxy} {mysql_cmd}"
+            result = subprocess.run(full_cmd, shell=True,
+                                    capture_output=True, text=True, timeout=20)
+        else:
+            run_cmd = _find_run_cmd()
+            if not run_cmd:
+                print("Remote transport requires RELAY_PROXY_CMD or bin/run-cmd relative to the relay script.",
+                      file=sys.stderr)
+                sys.exit(2)
+            mysql_cmd = _mysql_remote_quoted_cmdstr(sql)
+            result = subprocess.run(["python3", run_cmd, "local", mysql_cmd],
+                                    capture_output=True, text=True, timeout=20)
         if result.returncode != 0:
             err = result.stderr.strip() or "timed out waiting for MySQL result"
             print(f"Relay error: {err}", file=sys.stderr)
@@ -183,7 +208,7 @@ def _get_transport():
 
 
 def _get_proxy_cmd():
-    """Get the proxy command for remote MySQL access."""
+    """Get the proxy command for remote MySQL access (legacy — kept for compat)."""
     proxy = os.environ.get("RELAY_PROXY_CMD")
     if proxy:
         return proxy
@@ -192,6 +217,16 @@ def _get_proxy_cmd():
     candidate = os.path.join(script_dir, "..", "..", "bin", "run-cmd")
     if os.path.exists(candidate):
         return f"python3 {os.path.abspath(candidate)} local"
+    return None
+
+
+def _find_run_cmd():
+    """Locate bin/run-cmd relative to this script. Returns absolute path or None."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.join(script_dir, "..", "..", "bin", "run-cmd")
+    abspath = os.path.abspath(candidate)
+    if os.path.exists(abspath):
+        return abspath
     return None
 
 
@@ -211,15 +246,19 @@ def run_sql_raw(sql, fetch=False):
     transport = os.environ.get("RELAY_TRANSPORT", "local")
 
     if transport == "remote":
-        proxy_cmd = _get_proxy_cmd()
-        if not proxy_cmd:
-            return [] if fetch else None
-        mysql_cmd = _mysql_remote_shellcmd(sql)
-        full_cmd = proxy_cmd.replace("{}", mysql_cmd) if "{}" in proxy_cmd else f"{proxy_cmd} {mysql_cmd}"
-        result = subprocess.run(
-            full_cmd, shell=True,
-            capture_output=True, text=True, timeout=20,
-        )
+        user_proxy = os.environ.get("RELAY_PROXY_CMD")
+        if user_proxy:
+            mysql_cmd = _mysql_remote_shellcmd(sql)
+            full_cmd = user_proxy.replace("{}", mysql_cmd) if "{}" in user_proxy else f"{user_proxy} {mysql_cmd}"
+            result = subprocess.run(full_cmd, shell=True,
+                                    capture_output=True, text=True, timeout=20)
+        else:
+            run_cmd = _find_run_cmd()
+            if not run_cmd:
+                return [] if fetch else None
+            mysql_cmd = _mysql_remote_quoted_cmdstr(sql)
+            result = subprocess.run(["python3", run_cmd, "local", mysql_cmd],
+                                    capture_output=True, text=True, timeout=20)
         if result.returncode != 0:
             return [] if fetch else None
         return result.stdout.strip().splitlines() if fetch else []

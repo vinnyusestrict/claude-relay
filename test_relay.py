@@ -151,20 +151,39 @@ class TestRunSql(unittest.TestCase):
                 result = relay.run_sql("SELECT 1", fetch=True)
                 self.assertEqual(result, ["ok"])
 
-    def test_remote_calls_proxy(self):
-        with patch("relay_msg._get_transport", return_value="remote"):
-            with patch("relay_msg._get_proxy_cmd", return_value="my-proxy"):
-                with patch("subprocess.run", return_value=_mock_subprocess("ok")) as mock_run:
-                    result = relay.run_sql("SELECT 1", fetch=True)
-                    self.assertEqual(result, ["ok"])
-                    self.assertTrue(mock_run.call_args[1].get("shell"))
+    def test_remote_user_proxy_uses_shell(self):
+        """User-supplied RELAY_PROXY_CMD goes through the shell=True path so
+        custom proxy commands (ssh, docker exec, etc.) keep working."""
+        with patch("relay_msg._get_transport", return_value="remote"), \
+             patch.dict(os.environ, {"RELAY_PROXY_CMD": "my-proxy"}), \
+             patch("subprocess.run", return_value=_mock_subprocess("ok")) as mock_run:
+            result = relay.run_sql("SELECT 1", fetch=True)
+            self.assertEqual(result, ["ok"])
+            self.assertTrue(mock_run.call_args[1].get("shell"))
 
-    def test_remote_no_proxy_exits(self):
-        with patch("relay_msg._get_transport", return_value="remote"):
-            with patch("relay_msg._get_proxy_cmd", return_value=None):
-                with self.assertRaises(SystemExit) as ctx:
-                    relay.run_sql("SELECT 1")
-                self.assertEqual(ctx.exception.code, 2)
+    def test_remote_auto_run_cmd_uses_direct_invocation(self):
+        """Without RELAY_PROXY_CMD, fall back to direct python3 run-cmd invocation
+        (no shell) to bypass multi-layer shell-quoting corruption."""
+        env_without_proxy = {k: v for k, v in os.environ.items() if k != "RELAY_PROXY_CMD"}
+        with patch("relay_msg._get_transport", return_value="remote"), \
+             patch.dict(os.environ, env_without_proxy, clear=True), \
+             patch("relay_msg._find_run_cmd", return_value="/fake/bin/run-cmd"), \
+             patch("subprocess.run", return_value=_mock_subprocess("ok")) as mock_run:
+            result = relay.run_sql("SELECT 1", fetch=True)
+            self.assertEqual(result, ["ok"])
+            # First positional arg must be a list starting with python3 + run-cmd path.
+            called_args = mock_run.call_args[0][0]
+            self.assertEqual(called_args[:3], ["python3", "/fake/bin/run-cmd", "local"])
+            self.assertFalse(mock_run.call_args[1].get("shell", False))
+
+    def test_remote_no_proxy_no_run_cmd_exits(self):
+        env_without_proxy = {k: v for k, v in os.environ.items() if k != "RELAY_PROXY_CMD"}
+        with patch("relay_msg._get_transport", return_value="remote"), \
+             patch.dict(os.environ, env_without_proxy, clear=True), \
+             patch("relay_msg._find_run_cmd", return_value=None):
+            with self.assertRaises(SystemExit) as ctx:
+                relay.run_sql("SELECT 1")
+            self.assertEqual(ctx.exception.code, 2)
 
     def test_local_mysql_error_exits(self):
         with patch("relay_msg._get_transport", return_value="local"):
