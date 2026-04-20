@@ -110,7 +110,7 @@ def run_sql(sql, fetch=False):
     me_transport = _get_transport()
 
     if me_transport == "local":
-        cmd = ["mysql", "-u", DB_USER, f"-p{DB_PASS}", "-N", "-B", DB_NAME, "-e", sql]
+        cmd = ["mysql", "-u", DB_USER, f"-p{DB_PASS}", "--default-character-set=utf8mb4", "-N", "-B", DB_NAME, "-e", sql]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
             print(f"MySQL error: {result.stderr.strip()}", file=sys.stderr)
@@ -123,7 +123,7 @@ def run_sql(sql, fetch=False):
             print("Remote transport requires RELAY_PROXY_CMD env var or a proxy command.", file=sys.stderr)
             sys.exit(2)
         safe_sql = sql.replace("'", "'\\''")
-        mysql_cmd = f"mysql -u {DB_USER} -p{DB_PASS} -N -B {DB_NAME} -e '{safe_sql}'"
+        mysql_cmd = f"mysql -u {DB_USER} -p{DB_PASS} --default-character-set=utf8mb4 -N -B {DB_NAME} -e '{safe_sql}'"
         full_cmd = proxy_cmd.replace("{}", mysql_cmd) if "{}" in proxy_cmd else f"{proxy_cmd} {mysql_cmd}"
         result = subprocess.run(
             full_cmd, shell=True,
@@ -178,7 +178,7 @@ def run_sql_raw(sql, fetch=False):
         if not proxy_cmd:
             return [] if fetch else None
         safe_sql = sql.replace("'", "'\\''")
-        mysql_cmd = f"mysql -u {DB_USER} -p{DB_PASS} -N -B {DB_NAME} -e '{safe_sql}'"
+        mysql_cmd = f"mysql -u {DB_USER} -p{DB_PASS} --default-character-set=utf8mb4 -N -B {DB_NAME} -e '{safe_sql}'"
         full_cmd = proxy_cmd.replace("{}", mysql_cmd) if "{}" in proxy_cmd else f"{proxy_cmd} {mysql_cmd}"
         result = subprocess.run(
             full_cmd, shell=True,
@@ -188,7 +188,7 @@ def run_sql_raw(sql, fetch=False):
             return [] if fetch else None
         return result.stdout.strip().splitlines() if fetch else []
     else:
-        cmd = ["mysql", "-u", DB_USER, f"-p{DB_PASS}", "-N", "-B", DB_NAME, "-e", sql]
+        cmd = ["mysql", "-u", DB_USER, f"-p{DB_PASS}", "--default-character-set=utf8mb4", "-N", "-B", DB_NAME, "-e", sql]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
             return [] if fetch else None
