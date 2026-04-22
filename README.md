@@ -19,16 +19,22 @@ git clone https://github.com/vinnyusestrict/agent-relay.git
 
 ### 2. Configure the database
 
-Agent Relay uses local MySQL/MariaDB for message storage. Tables are auto-created on first use.
+Two backends supported. Pick one:
+
+**Option A — SQLite** (zero deps, single file — good for solo setups):
+
+```
+# .relay-env
+RELAY_DB_DRIVER=sqlite
+RELAY_DB_PATH=~/.agent-relay.sqlite3
+```
+
+No server install needed. The file is auto-created on first use.
+
+**Option B — MySQL / MariaDB** (default; good for multi-host / networked setups):
 
 ```bash
 mysql -u root -proot -e "CREATE DATABASE IF NOT EXISTS agent_relay"
-```
-
-Create a `.relay-env` file in the relay directory (or your project root) with your credentials:
-
-```bash
-cp lib/relay/.relay-env.example lib/relay/.relay-env
 ```
 
 ```
@@ -38,7 +44,7 @@ RELAY_DB_PASS=root
 RELAY_DB_NAME=agent_relay
 ```
 
-This file is gitignored — credentials never get committed.
+Either way: `.relay-env` lives in the relay directory (or your project root), is gitignored, and tables are auto-created on first use.
 
 ### 3. Register agents
 
@@ -153,18 +159,48 @@ RELAY_PROXY_CMD=ssh myhost mysql
 
 The proxy command receives the full `mysql -u ... -e '...'` invocation. If it contains `{}`, the MySQL command replaces the placeholder; otherwise it's appended.
 
+## Wake-up nudges (optional)
+
+An agent waiting for a message has no way to know one arrived until something wakes its session (a user prompt, a scheduled poll). For faster turn-around, `relay-msg send` can drop a **flag file** as a post-INSERT side-effect, and a separate watcher process picks up the flag and wakes the receiver's terminal pane.
+
+**Enable** by setting two env vars in `.relay-env`:
+
+```
+RELAY_NUDGE_DIR=/path/to/shared/nudge-dir
+RELAY_NUDGE_AGENTS=alice,bob,carol     # allowlist; unset = nudge everyone
+```
+
+When `alice` sends to `bob`, relay writes `/path/to/shared/nudge-dir/.nudge-bob` with the content `check inbox\n`. If `RELAY_NUDGE_DIR` is unset, the side-effect is skipped — no behavior change from the default.
+
+**Flag-file contract** (for writing your own watcher):
+- Filename: `.nudge-<agent-name>` in `$RELAY_NUDGE_DIR`.
+- Contents: a single line of text (default: `check inbox`). Your watcher sends this text to the agent's pane.
+- Watcher is expected to `rm -f` the flag after consuming.
+- Best-effort: `relay-msg` silently swallows `OSError` on write. Nudges are a wake-up optimization, not part of the delivery guarantee.
+
+**Reference watchers** in `watchers/`:
+- `cmux-nudge-watcher` — injects keystrokes to [cmux](https://github.com/anthropics/cmux) panes (only example; ships as template).
+- `tmux-nudge-watcher` — `tmux send-keys` to a window/pane named after the agent.
+- `notify-nudge-watcher` — macOS notification only (no keystroke injection). Useful for agents in GUI apps like Claude Desktop with no pane to type into.
+
+Write your own watcher in any language — it's a plain directory-polling contract.
+
 ## Environment Variables
 
 All configurable via `.relay-env` file or environment variables (env vars take precedence).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RELAY_DB_USER` | `root` | MySQL user |
-| `RELAY_DB_PASS` | `root` | MySQL password |
-| `RELAY_DB_NAME` | `agent_relay` | Database name |
+| `RELAY_DB_DRIVER` | `mysql` | `mysql` or `sqlite` |
+| `RELAY_DB_USER` | `root` | MySQL user *(mysql only)* |
+| `RELAY_DB_PASS` | `root` | MySQL password *(mysql only)* |
+| `RELAY_DB_NAME` | `agent_relay` | MySQL database name *(mysql only)* |
+| `RELAY_DB_PATH` | `~/.agent-relay.sqlite3` | SQLite file path *(sqlite only)* |
 | `RELAY_IDENTITY` | *(auto-detect)* | Force agent identity |
-| `RELAY_TRANSPORT` | `local` | `local` or `remote` |
-| `RELAY_PROXY_CMD` | *(none)* | Proxy command for remote transport |
+| `RELAY_TRANSPORT` | `local` | `local` or `remote` *(mysql only)* |
+| `RELAY_PROXY_CMD` | *(none)* | Proxy command for remote transport *(mysql only)* |
+| `RELAY_NUDGE_DIR` | *(unset)* | Directory to drop `.nudge-<agent>` flag files (unset = nudges disabled) |
+| `RELAY_NUDGE_AGENTS` | *(all)* | Comma-separated allowlist of agents to nudge |
 
 ## Database
 
@@ -182,5 +218,6 @@ Messages are never deleted — marked as read via `read_at` timestamp.
 ## Requirements
 
 - Python 3.8+
-- MySQL or MariaDB (local or accessible via proxy)
-- `mysql` CLI client (for local transport)
+- One of:
+  - `sqlite3` CLI client (for SQLite backend — usually preinstalled on macOS / Linux)
+  - `mysql` CLI client + MySQL or MariaDB server (for MySQL backend)

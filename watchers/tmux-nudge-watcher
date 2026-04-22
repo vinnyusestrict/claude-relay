@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# tmux-nudge-watcher — reference watcher that wakes tmux sessions on relay nudge.
+#
+# Flag-file contract: ./<WATCH_DIR>/.nudge-<agent>, contents = keystrokes to
+# inject (default: "check inbox"). See the Agent Relay README "Wake-up nudges"
+# section.
+#
+# How this watcher maps `<agent>` to a tmux target:
+#   1. Default: tmux session named exactly `<agent>` (case-insensitive).
+#   2. Override: agent `<N>`'s target is whatever `TMUX_TARGET_<N>` env var
+#      says (e.g. `TMUX_TARGET_alice="work:1.0"` → tmux target spec).
+# If the target session/window doesn't exist, the nudge is silently skipped.
+#
+# Usage:
+#   cd <project-with-.nudge-* files>
+#   ./tmux-nudge-watcher [WATCH_DIR]
+#
+# WATCH_DIR defaults to the parent of this script's directory.
+
+set -euo pipefail
+
+WATCH_DIR="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
+POLL_INTERVAL=3
+DEBOUNCE_SECONDS=2
+
+log() { echo "[tmux-nudge-watcher] $*"; }
+
+resolve_target() {
+    local agent="$1"
+    local upper; upper=$(echo "$agent" | tr '[:lower:]' '[:upper:]')
+    local override_var="TMUX_TARGET_${upper}"
+    # Env-var override wins.
+    if [ -n "${!override_var:-}" ]; then
+        echo "${!override_var}"
+        return 0
+    fi
+    # Default: case-insensitive tmux session name match.
+    local match
+    match=$(tmux list-sessions -F '#S' 2>/dev/null |
+            awk -v a="$agent" 'tolower($0)==tolower(a){print; exit}')
+    echo "$match"
+}
+
+nudge_agent() {
+    local agent="$1"
+    local message="${2:-check inbox}"
+    local target; target=$(resolve_target "$agent")
+    if [ -z "$target" ]; then
+        log "no tmux target for '$agent' — skipping"
+        return 0
+    fi
+    log "nudging $agent ($target): $message"
+    tmux send-keys -t "$target" "$message" Enter 2>/dev/null ||
+        log "WARN: send-keys to '$target' failed"
+}
+
+log "starting in $WATCH_DIR (poll every ${POLL_INTERVAL}s, debounce ${DEBOUNCE_SECONDS}s)"
+
+while true; do
+    for flag in "$WATCH_DIR"/.nudge-*; do
+        [ -e "$flag" ] || continue
+
+        # Debounce: wait for mtime to be stable (handles rapid-fire sends
+        # and gives the user time to finish typing if their pane is the target).
+        waited=0
+        while true; do
+            last_mtime=$(stat -f %m "$flag" 2>/dev/null || stat -c %Y "$flag" 2>/dev/null || echo 0)
+            sleep "$DEBOUNCE_SECONDS"
+            [ -e "$flag" ] || break 2
+            new_mtime=$(stat -f %m "$flag" 2>/dev/null || stat -c %Y "$flag" 2>/dev/null || echo 0)
+            [ "$new_mtime" = "$last_mtime" ] && break
+            waited=$((waited + DEBOUNCE_SECONDS))
+            [ "$waited" -ge 30 ] && { log "WARN: $flag kept rewriting — forcing"; break; }
+        done
+
+        agent="$(basename "$flag")"; agent="${agent#.nudge-}"
+        message="$(cat "$flag" 2>/dev/null || true)"
+        message="${message:-check inbox}"
+        rm -f "$flag"
+        nudge_agent "$agent" "$message"
+    done
+    sleep "$POLL_INTERVAL"
+done

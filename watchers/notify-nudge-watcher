@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# notify-nudge-watcher — fires a desktop notification on relay nudge.
+#
+# Use this for agents that live in GUI apps (e.g. Claude Desktop) where there
+# is no terminal pane to inject keystrokes into. The nudge becomes a visible
+# tray bubble prompting the human to focus the app and type.
+#
+# Flag-file contract: ./<WATCH_DIR>/.nudge-<agent>, contents = message text
+# (default: "check inbox"). See Agent Relay README "Wake-up nudges".
+#
+# Notification backend auto-detected:
+#   - macOS:    osascript
+#   - Linux:    notify-send  (from libnotify-bin)
+# Override with NUDGE_NOTIFY_CMD env var, e.g.
+#   NUDGE_NOTIFY_CMD='dunstify' ./notify-nudge-watcher
+#
+# Usage:
+#   ./notify-nudge-watcher [WATCH_DIR]
+
+set -euo pipefail
+
+WATCH_DIR="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
+POLL_INTERVAL=3
+
+log() { echo "[notify-nudge-watcher] $*"; }
+
+notify() {
+    local title="$1"
+    local body="$2"
+    if [ -n "${NUDGE_NOTIFY_CMD:-}" ]; then
+        "$NUDGE_NOTIFY_CMD" "$title" "$body" || true
+    elif [ "$(uname)" = "Darwin" ]; then
+        /usr/bin/osascript -e \
+          "display notification \"${body//\"/\\\"}\" with title \"${title//\"/\\\"}\"" || true
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send "$title" "$body" || true
+    else
+        log "no notification backend available (install libnotify-bin or set NUDGE_NOTIFY_CMD)"
+    fi
+}
+
+log "starting in $WATCH_DIR (poll every ${POLL_INTERVAL}s)"
+
+while true; do
+    for flag in "$WATCH_DIR"/.nudge-*; do
+        [ -e "$flag" ] || continue
+        agent="$(basename "$flag")"; agent="${agent#.nudge-}"
+        message="$(cat "$flag" 2>/dev/null || true)"
+        message="${message:-check inbox}"
+        rm -f "$flag"
+        log "notifying '$agent': $message"
+        notify "$agent — relay" "$message"
+    done
+    sleep "$POLL_INTERVAL"
+done
