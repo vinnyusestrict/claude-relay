@@ -389,10 +389,39 @@ def cmd_send(target, message):
     values = ", ".join(f"('{_esc(r)}', '{_esc(me)}', '{safe_msg}')" for r in recipients)
     run_sql(f"INSERT INTO relay_messages (target, sender, message) VALUES {values}")
 
+    _nudge_recipients(recipients)
+
     if len(recipients) > 1:
         print(f"Broadcast ({target}) sent to: {', '.join(recipients)}")
     else:
         print(f"Message sent to {recipients[0]}")
+
+
+def _nudge_recipients(recipients):
+    """Best-effort side-effect: drop a `.nudge-<agent>` flag file in
+    $RELAY_NUDGE_DIR for each recipient so a cmux-nudge-watcher can wake the
+    agent's pane. Controlled by two env vars (typically set in `.relay-env`):
+
+      RELAY_NUDGE_DIR     — directory to write flag files into. Unset = disabled.
+      RELAY_NUDGE_AGENTS  — comma-separated allowlist (e.g. "cody,carl,abby").
+                            Unset = nudge all recipients.
+
+    Silent no-op if disabled, the dir doesn't exist, or the write fails —
+    this is a wake-up optimization, not part of the delivery guarantee.
+    """
+    nudge_dir = os.environ.get("RELAY_NUDGE_DIR")
+    if not nudge_dir:
+        return
+    allow = os.environ.get("RELAY_NUDGE_AGENTS", "").strip()
+    allowlist = {a.strip() for a in allow.split(",") if a.strip()} if allow else None
+    for r in recipients:
+        if allowlist is not None and r not in allowlist:
+            continue
+        try:
+            with open(os.path.join(nudge_dir, f".nudge-{r}"), "w") as f:
+                f.write("check inbox\n")
+        except OSError:
+            pass
 
 
 def cmd_check(peek=False, history=False):
