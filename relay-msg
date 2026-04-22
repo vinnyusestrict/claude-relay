@@ -20,16 +20,18 @@ Options for register:
 Agents self-register into a relay_agents table. No hardcoded peers.
 Groups are derived from agent registrations — no hardcoded broadcast lists.
 
-Messages are stored in local MySQL/MariaDB. Read messages are marked with
+Messages are stored in MySQL/MariaDB or SQLite. Read messages are marked with
 read_at (not deleted) to preserve conversation history.
 
 Configuration via .relay-env file (gitignored) or environment variables:
-  RELAY_DB_USER      MySQL user (default: root)
-  RELAY_DB_PASS      MySQL password (default: root)
-  RELAY_DB_NAME      Database name (default: agent_relay)
+  RELAY_DB_DRIVER    "mysql" (default) or "sqlite"
+  RELAY_DB_USER      MySQL user (default: root)              [mysql only]
+  RELAY_DB_PASS      MySQL password (default: root)           [mysql only]
+  RELAY_DB_NAME      MySQL database name (default: agent_relay)   [mysql only]
+  RELAY_DB_PATH      SQLite file path (default: ~/.agent-relay.sqlite3)  [sqlite only]
   RELAY_IDENTITY     Force agent identity (skips auto-detection)
-  RELAY_TRANSPORT    "local" or "remote" (default: local)
-  RELAY_PROXY_CMD    Command to proxy MySQL for remote agents (optional)
+  RELAY_TRANSPORT    "local" or "remote" (default: local)     [mysql only]
+  RELAY_PROXY_CMD    Command to proxy MySQL for remote agents (optional, mysql only)
 """
 import sys
 import os
@@ -69,11 +71,35 @@ def _load_env_file():
 
 _load_env_file()
 
+DB_DRIVER = os.environ.get("RELAY_DB_DRIVER", "mysql").strip().lower()
 DB_USER = os.environ.get("RELAY_DB_USER", "root")
 DB_PASS = os.environ.get("RELAY_DB_PASS", "root")
 DB_NAME = os.environ.get("RELAY_DB_NAME", "agent_relay")
+DB_PATH = os.path.expanduser(os.environ.get("RELAY_DB_PATH", "~/.agent-relay.sqlite3"))
 
 _schema_checked = False
+
+
+def _is_sqlite():
+    return DB_DRIVER == "sqlite"
+
+
+def _sqlite_cmd(sql):
+    """Build a sqlite3 CLI invocation matching mysql's -N -B output shape
+    (tab-separated, no headers, NULL rendered as the literal string NULL)."""
+    return ["sqlite3", "-batch", "-noheader", "-separator", "\t",
+            "-nullvalue", "NULL", DB_PATH, sql]
+
+
+def _mysql_local_cmd(sql):
+    return ["mysql", "-u", DB_USER, f"-p{DB_PASS}",
+            "--default-character-set=utf8mb4", "-N", "-B", DB_NAME, "-e", sql]
+
+
+def _mysql_remote_shellcmd(sql):
+    safe_sql = sql.replace("'", "'\\''")
+    return (f"mysql -u {DB_USER} -p{DB_PASS} --default-character-set=utf8mb4 "
+            f"-N -B {DB_NAME} -e '{safe_sql}'")
 
 
 def detect_self():
@@ -106,12 +132,18 @@ def detect_self():
 
 
 def run_sql(sql, fetch=False):
-    """Run SQL against MySQL. Routes through proxy for remote agents."""
+    """Run SQL. Routes through proxy for remote mysql agents; sqlite is always local."""
+    if _is_sqlite():
+        result = subprocess.run(_sqlite_cmd(sql), capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            print(f"SQLite error: {result.stderr.strip()}", file=sys.stderr)
+            sys.exit(2)
+        return result.stdout.strip().splitlines() if fetch else []
+
     me_transport = _get_transport()
 
     if me_transport == "local":
-        cmd = ["mysql", "-u", DB_USER, f"-p{DB_PASS}", "--default-character-set=utf8mb4", "-N", "-B", DB_NAME, "-e", sql]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(_mysql_local_cmd(sql), capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
             print(f"MySQL error: {result.stderr.strip()}", file=sys.stderr)
             sys.exit(2)
@@ -122,8 +154,7 @@ def run_sql(sql, fetch=False):
         if not proxy_cmd:
             print("Remote transport requires RELAY_PROXY_CMD env var or a proxy command.", file=sys.stderr)
             sys.exit(2)
-        safe_sql = sql.replace("'", "'\\''")
-        mysql_cmd = f"mysql -u {DB_USER} -p{DB_PASS} --default-character-set=utf8mb4 -N -B {DB_NAME} -e '{safe_sql}'"
+        mysql_cmd = _mysql_remote_shellcmd(sql)
         full_cmd = proxy_cmd.replace("{}", mysql_cmd) if "{}" in proxy_cmd else f"{proxy_cmd} {mysql_cmd}"
         result = subprocess.run(
             full_cmd, shell=True,
@@ -171,14 +202,19 @@ def run_sql_raw(sql, fetch=False):
     (which would cause infinite recursion). Instead it reads transport
     directly from RELAY_TRANSPORT env var or .relay-env.
     """
+    if _is_sqlite():
+        result = subprocess.run(_sqlite_cmd(sql), capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            return [] if fetch else None
+        return result.stdout.strip().splitlines() if fetch else []
+
     transport = os.environ.get("RELAY_TRANSPORT", "local")
 
     if transport == "remote":
         proxy_cmd = _get_proxy_cmd()
         if not proxy_cmd:
             return [] if fetch else None
-        safe_sql = sql.replace("'", "'\\''")
-        mysql_cmd = f"mysql -u {DB_USER} -p{DB_PASS} --default-character-set=utf8mb4 -N -B {DB_NAME} -e '{safe_sql}'"
+        mysql_cmd = _mysql_remote_shellcmd(sql)
         full_cmd = proxy_cmd.replace("{}", mysql_cmd) if "{}" in proxy_cmd else f"{proxy_cmd} {mysql_cmd}"
         result = subprocess.run(
             full_cmd, shell=True,
@@ -188,8 +224,7 @@ def run_sql_raw(sql, fetch=False):
             return [] if fetch else None
         return result.stdout.strip().splitlines() if fetch else []
     else:
-        cmd = ["mysql", "-u", DB_USER, f"-p{DB_PASS}", "--default-character-set=utf8mb4", "-N", "-B", DB_NAME, "-e", sql]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(_mysql_local_cmd(sql), capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
             return [] if fetch else None
         return result.stdout.strip().splitlines() if fetch else []
@@ -200,48 +235,79 @@ def _esc(s):
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
 
+_MYSQL_SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS relay_agents (
+        name VARCHAR(40) PRIMARY KEY,
+        transport ENUM('local','remote') NOT NULL DEFAULT 'local',
+        cwd_pattern VARCHAR(255) DEFAULT NULL,
+        registered_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS relay_agent_groups (
+        agent_name VARCHAR(40) NOT NULL,
+        group_name VARCHAR(40) NOT NULL,
+        PRIMARY KEY (agent_name, group_name),
+        FOREIGN KEY (agent_name) REFERENCES relay_agents(name) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS relay_agent_aliases (
+        alias_name VARCHAR(40) PRIMARY KEY,
+        agent_name VARCHAR(40) NOT NULL,
+        FOREIGN KEY (agent_name) REFERENCES relay_agents(name) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS relay_messages (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        target VARCHAR(40) NOT NULL,
+        sender VARCHAR(40) NOT NULL,
+        message TEXT NOT NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        read_at TIMESTAMP NULL DEFAULT NULL,
+        KEY idx_target (target),
+        KEY idx_read_at (read_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+]
+
+# SQLite: no ENUM (use CHECK), no inline KEY (separate CREATE INDEX), no engine.
+# AUTOINCREMENT requires INTEGER PRIMARY KEY. FKs work but only enforce when
+# `PRAGMA foreign_keys = ON` is set per-connection — we don't rely on cascade
+# semantics since register explicitly clears dependent rows.
+_SQLITE_SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS relay_agents (
+        name TEXT PRIMARY KEY,
+        transport TEXT NOT NULL DEFAULT 'local' CHECK (transport IN ('local','remote')),
+        cwd_pattern TEXT DEFAULT NULL,
+        registered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )""",
+    """CREATE TABLE IF NOT EXISTS relay_agent_groups (
+        agent_name TEXT NOT NULL,
+        group_name TEXT NOT NULL,
+        PRIMARY KEY (agent_name, group_name)
+    )""",
+    """CREATE TABLE IF NOT EXISTS relay_agent_aliases (
+        alias_name TEXT PRIMARY KEY,
+        agent_name TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS relay_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target TEXT NOT NULL,
+        sender TEXT NOT NULL,
+        message TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        read_at TEXT DEFAULT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_target ON relay_messages (target)",
+    "CREATE INDEX IF NOT EXISTS idx_read_at ON relay_messages (read_at)",
+]
+
+
 def ensure_schema():
     """Idempotent: create tables if they don't exist."""
     global _schema_checked
     if _schema_checked:
         return
     _schema_checked = True
+    stmts = _SQLITE_SCHEMA if _is_sqlite() else _MYSQL_SCHEMA
     try:
-        run_sql_raw("""
-            CREATE TABLE IF NOT EXISTS relay_agents (
-                name VARCHAR(40) PRIMARY KEY,
-                transport ENUM('local','remote') NOT NULL DEFAULT 'local',
-                cwd_pattern VARCHAR(255) DEFAULT NULL,
-                registered_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """)
-        run_sql_raw("""
-            CREATE TABLE IF NOT EXISTS relay_agent_groups (
-                agent_name VARCHAR(40) NOT NULL,
-                group_name VARCHAR(40) NOT NULL,
-                PRIMARY KEY (agent_name, group_name),
-                FOREIGN KEY (agent_name) REFERENCES relay_agents(name) ON DELETE CASCADE
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """)
-        run_sql_raw("""
-            CREATE TABLE IF NOT EXISTS relay_agent_aliases (
-                alias_name VARCHAR(40) PRIMARY KEY,
-                agent_name VARCHAR(40) NOT NULL,
-                FOREIGN KEY (agent_name) REFERENCES relay_agents(name) ON DELETE CASCADE
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """)
-        run_sql_raw("""
-            CREATE TABLE IF NOT EXISTS relay_messages (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                target VARCHAR(40) NOT NULL,
-                sender VARCHAR(40) NOT NULL,
-                message TEXT NOT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                read_at TIMESTAMP NULL DEFAULT NULL,
-                KEY idx_target (target),
-                KEY idx_read_at (read_at)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """)
+        for s in stmts:
+            run_sql_raw(s)
     except SystemExit:
         pass
 
@@ -249,15 +315,24 @@ def ensure_schema():
 # ── Commands ────────────────────────────────────────────────────────────
 
 
+def _upsert_clause(conflict_col, update_pairs):
+    """Return the dialect-specific tail of an upsert INSERT statement.
+    `update_pairs` is a list of "col=value" strings (already escaped)."""
+    sets = ", ".join(update_pairs)
+    if _is_sqlite():
+        return f"ON CONFLICT({conflict_col}) DO UPDATE SET {sets}"
+    return f"ON DUPLICATE KEY UPDATE {sets}"
+
+
 def cmd_register(name, groups=None, cwd_pattern=None, transport="local", aliases=None):
     """Register an agent."""
     ensure_schema()
     safe_name = _esc(name)
     safe_cwd = f"'{_esc(cwd_pattern)}'" if cwd_pattern else "NULL"
+    upsert = _upsert_clause("name", [f"transport='{_esc(transport)}'", f"cwd_pattern={safe_cwd}"])
     run_sql(
         f"INSERT INTO relay_agents (name, transport, cwd_pattern) "
-        f"VALUES ('{safe_name}', '{_esc(transport)}', {safe_cwd}) "
-        f"ON DUPLICATE KEY UPDATE transport='{_esc(transport)}', cwd_pattern={safe_cwd}"
+        f"VALUES ('{safe_name}', '{_esc(transport)}', {safe_cwd}) {upsert}"
     )
     # Clear old groups and set new ones.
     run_sql(f"DELETE FROM relay_agent_groups WHERE agent_name = '{safe_name}'")
@@ -268,11 +343,11 @@ def cmd_register(name, groups=None, cwd_pattern=None, transport="local", aliases
         )
     # Clear old aliases and set new ones.
     run_sql(f"DELETE FROM relay_agent_aliases WHERE agent_name = '{safe_name}'")
+    alias_upsert = _upsert_clause("alias_name", [f"agent_name = '{safe_name}'"])
     for a in (aliases or []):
         run_sql(
             f"INSERT INTO relay_agent_aliases (alias_name, agent_name) "
-            f"VALUES ('{_esc(a)}', '{safe_name}') "
-            f"ON DUPLICATE KEY UPDATE agent_name = '{safe_name}'"
+            f"VALUES ('{_esc(a)}', '{safe_name}') {alias_upsert}"
         )
     parts = []
     if groups:
@@ -293,10 +368,17 @@ def cmd_unregister(name):
 def cmd_list():
     """List all registered agents and groups."""
     ensure_schema()
+    if _is_sqlite():
+        # SQLite's GROUP_CONCAT(DISTINCT x) doesn't take a custom separator,
+        # so it emits comma-joined. REPLACE adds the space for display parity.
+        groups_col = "REPLACE(GROUP_CONCAT(DISTINCT g.group_name), ',', ', ')"
+        aliases_col = "REPLACE(GROUP_CONCAT(DISTINCT al.alias_name), ',', ', ')"
+    else:
+        groups_col = "GROUP_CONCAT(DISTINCT g.group_name ORDER BY g.group_name SEPARATOR ', ')"
+        aliases_col = "GROUP_CONCAT(DISTINCT al.alias_name ORDER BY al.alias_name SEPARATOR ', ')"
     rows = run_sql(
-        "SELECT a.name, a.transport, a.cwd_pattern, "
-        "GROUP_CONCAT(DISTINCT g.group_name ORDER BY g.group_name SEPARATOR ', ') AS groups, "
-        "GROUP_CONCAT(DISTINCT al.alias_name ORDER BY al.alias_name SEPARATOR ', ') AS aliases "
+        f"SELECT a.name, a.transport, a.cwd_pattern, "
+        f"{groups_col} AS groups, {aliases_col} AS aliases "
         "FROM relay_agents a "
         "LEFT JOIN relay_agent_groups g ON a.name = g.agent_name "
         "LEFT JOIN relay_agent_aliases al ON a.name = al.agent_name "
@@ -464,7 +546,7 @@ def cmd_check(peek=False, history=False):
     # Mark unread as read (unless peeking or viewing history).
     if not peek and not history and ids:
         id_list = ",".join(ids)
-        run_sql(f"UPDATE relay_messages SET read_at = NOW() WHERE id IN ({id_list}) AND read_at IS NULL")
+        run_sql(f"UPDATE relay_messages SET read_at = CURRENT_TIMESTAMP WHERE id IN ({id_list}) AND read_at IS NULL")
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────
